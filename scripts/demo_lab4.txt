@@ -1,0 +1,103 @@
+# ===== Lab 4 demo: flat block filesystem =====
+# --- format: 512 KB image, 256 B blocks, 32 inodes
+mkfs 32
+ls
+stat missing
+
+# --- create / ls / stat
+create hello.txt
+create data.bin
+ls
+stat hello.txt
+create hello.txt
+create bad/name
+
+# --- open: lowest free fd, same file opened twice
+open hello.txt
+open hello.txt
+open data.bin
+
+# --- write / seek / read with independent offsets
+write 0 26
+write 0 6 " world"
+seek 1 0
+read 1 10
+read 1 100
+read 1 10
+seek 0 3
+write 0 3 xyz
+seek 1 0
+read 1 32
+stat hello.txt
+
+# --- multi-block file crossing into the indirect block (8 direct * 256 B = 2048 B)
+write 2 2600
+stat data.bin
+seek 2 2040
+read 2 16
+
+# --- close and fd reuse
+close 1
+open data.bin
+close 1
+close 1
+
+# --- hard links
+link hello.txt greeting
+ls
+stat greeting
+unlink hello.txt
+ls
+stat greeting
+link nothing x
+
+# --- sparse truncate (grow): no blocks are allocated for the zero region
+create sparse
+truncate sparse 5000
+stat sparse
+open sparse
+read 1 8
+# write past EOF leaves the gap sparse
+seek 1 7000
+write 1 4 TAIL
+stat sparse
+seek 1 6996
+read 1 8
+close 1
+
+# --- truncate (shrink) frees blocks, including the indirect block
+truncate data.bin 300
+stat data.bin
+seek 2 0
+read 2 300
+truncate data.bin 600
+seek 2 290
+read 2 20
+
+# --- unlinked-but-open file stays usable until the last fd is closed
+create temp
+open temp
+write 1 11 "still alive"
+unlink temp
+ls
+seek 1 0
+read 1 20
+write 1 1 !
+seek 1 0
+read 1 20
+close 1
+# inode of 'temp' is now released; creating a file reuses it
+create reuse
+stat reuse
+
+# --- cleanup and errors
+close 0
+close 2
+unlink greeting
+unlink data.bin
+unlink sparse
+unlink reuse
+ls
+read 0 10
+unlink greeting
+exit

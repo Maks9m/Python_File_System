@@ -1,0 +1,247 @@
+# ===== Lab 4 demo: flat block filesystem =====
+# --- format: 512 KB image, 256 B blocks, 32 inodes
+fs> mkfs 32
+formatted disk.img: 2048 blocks x 256 B, 32 inodes, bitmap@1, inodes@2, data@6
+fs> ls
+  (0 entries)
+fs> stat missing
+error: no such file: 'missing'
+
+# --- create / ls / stat
+fs> create hello.txt
+created 'hello.txt' (inode 1)
+fs> create data.bin
+created 'data.bin' (inode 2)
+fs> ls
+     1  REGULAR        0  hello.txt
+     2  REGULAR        0  data.bin
+  (2 entries)
+fs> stat hello.txt
+  inode:      1
+  type:       REGULAR (1)
+  hard_links: 1
+  size:       0 bytes
+  blocks:     0 data + 0 indirect
+  direct:     [0, 0, 0, 0, 0, 0, 0, 0]
+  indirect:   0
+fs> create hello.txt
+error: file exists: 'hello.txt'
+fs> create bad/name
+error: invalid character in filename 'bad/name'
+
+# --- open: lowest free fd, same file opened twice
+fs> open hello.txt
+fd = 0
+fs> open hello.txt
+fd = 1
+fs> open data.bin
+fd = 2
+
+# --- write / seek / read with independent offsets
+fs> write 0 26
+fd 0: wrote 26 bytes, offset = 26
+fs> write 0 6 " world"
+fd 0: wrote 6 bytes, offset = 32
+fs> seek 1 0
+fd 1: offset = 0
+fs> read 1 10
+fd 1: read 10 bytes: "ABCDEFGHIJ"
+fs> read 1 100
+fd 1: read 22 bytes: "KLMNOPQRSTUVWXYZ world"
+fs> read 1 10
+fd 1: read 0 bytes: ""
+fs> seek 0 3
+fd 0: offset = 3
+fs> write 0 3 xyz
+fd 0: wrote 3 bytes, offset = 6
+fs> seek 1 0
+fd 1: offset = 0
+fs> read 1 32
+fd 1: read 32 bytes: "ABCxyzGHIJKLMNOPQRSTUVWXYZ world"
+fs> stat hello.txt
+  inode:      1
+  type:       REGULAR (1)
+  hard_links: 1
+  size:       32 bytes
+  blocks:     1 data + 0 indirect
+  direct:     [7, 0, 0, 0, 0, 0, 0, 0]
+  indirect:   0
+
+# --- multi-block file crossing into the indirect block (8 direct * 256 B = 2048 B)
+fs> write 2 2600
+fd 2: wrote 2600 bytes, offset = 2600
+fs> stat data.bin
+  inode:      2
+  type:       REGULAR (1)
+  hard_links: 1
+  size:       2600 bytes
+  blocks:     11 data + 1 indirect
+  direct:     [8, 9, 10, 11, 12, 13, 14, 15]
+  indirect:   17
+  indirect map: [8]=16 [9]=18 [10]=19
+fs> seek 2 2040
+fd 2: offset = 2040
+fs> read 2 16
+fd 2: read 16 bytes: "MNOPQRSTUVWXYZAB"
+
+# --- close and fd reuse
+fs> close 1
+closed fd 1
+fs> open data.bin
+fd = 1
+fs> close 1
+closed fd 1
+fs> close 1
+error: bad file descriptor: 1
+
+# --- hard links
+fs> link hello.txt greeting
+linked 'greeting' -> 'hello.txt'
+fs> ls
+     1  REGULAR       32  hello.txt
+     2  REGULAR     2600  data.bin
+     1  REGULAR       32  greeting
+  (3 entries)
+fs> stat greeting
+  inode:      1
+  type:       REGULAR (1)
+  hard_links: 2
+  size:       32 bytes
+  blocks:     1 data + 0 indirect
+  direct:     [7, 0, 0, 0, 0, 0, 0, 0]
+  indirect:   0
+fs> unlink hello.txt
+unlinked 'hello.txt'
+fs> ls
+     2  REGULAR     2600  data.bin
+     1  REGULAR       32  greeting
+  (2 entries)
+fs> stat greeting
+  inode:      1
+  type:       REGULAR (1)
+  hard_links: 1
+  size:       32 bytes
+  blocks:     1 data + 0 indirect
+  direct:     [7, 0, 0, 0, 0, 0, 0, 0]
+  indirect:   0
+fs> link nothing x
+error: no such file: 'nothing'
+
+# --- sparse truncate (grow): no blocks are allocated for the zero region
+fs> create sparse
+created 'sparse' (inode 3)
+fs> truncate sparse 5000
+truncated 'sparse' to 5000 bytes
+fs> stat sparse
+  inode:      3
+  type:       REGULAR (1)
+  hard_links: 1
+  size:       5000 bytes
+  blocks:     0 data + 0 indirect
+  direct:     [0, 0, 0, 0, 0, 0, 0, 0]
+  indirect:   0
+fs> open sparse
+fd = 1
+fs> read 1 8
+fd 1: read 8 bytes: "\x00\x00\x00\x00\x00\x00\x00\x00"
+# write past EOF leaves the gap sparse
+fs> seek 1 7000
+fd 1: offset = 7000
+fs> write 1 4 TAIL
+fd 1: wrote 4 bytes, offset = 7004
+fs> stat sparse
+  inode:      3
+  type:       REGULAR (1)
+  hard_links: 1
+  size:       7004 bytes
+  blocks:     1 data + 1 indirect
+  direct:     [0, 0, 0, 0, 0, 0, 0, 0]
+  indirect:   21
+  indirect map: [27]=20
+fs> seek 1 6996
+fd 1: offset = 6996
+fs> read 1 8
+fd 1: read 8 bytes: "\x00\x00\x00\x00TAIL"
+fs> close 1
+closed fd 1
+
+# --- truncate (shrink) frees blocks, including the indirect block
+fs> truncate data.bin 300
+truncated 'data.bin' to 300 bytes
+fs> stat data.bin
+  inode:      2
+  type:       REGULAR (1)
+  hard_links: 1
+  size:       300 bytes
+  blocks:     2 data + 0 indirect
+  direct:     [8, 9, 0, 0, 0, 0, 0, 0]
+  indirect:   0
+fs> seek 2 0
+fd 2: offset = 0
+fs> read 2 300
+fd 2: read 300 bytes: "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMN"
+fs> truncate data.bin 600
+truncated 'data.bin' to 600 bytes
+fs> seek 2 290
+fd 2: offset = 290
+fs> read 2 20
+fd 2: read 20 bytes: "EFGHIJKLMN\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+
+# --- unlinked-but-open file stays usable until the last fd is closed
+fs> create temp
+created 'temp' (inode 4)
+fs> open temp
+fd = 1
+fs> write 1 11 "still alive"
+fd 1: wrote 11 bytes, offset = 11
+fs> unlink temp
+unlinked 'temp'
+fs> ls
+     3  REGULAR     7004  sparse
+     2  REGULAR      600  data.bin
+     1  REGULAR       32  greeting
+  (3 entries)
+fs> seek 1 0
+fd 1: offset = 0
+fs> read 1 20
+fd 1: read 11 bytes: "still alive"
+fs> write 1 1 !
+fd 1: wrote 1 bytes, offset = 12
+fs> seek 1 0
+fd 1: offset = 0
+fs> read 1 20
+fd 1: read 12 bytes: "still alive!"
+fs> close 1
+closed fd 1
+# inode of 'temp' is now released; creating a file reuses it
+fs> create reuse
+created 'reuse' (inode 4)
+fs> stat reuse
+  inode:      4
+  type:       REGULAR (1)
+  hard_links: 1
+  size:       0 bytes
+  blocks:     0 data + 0 indirect
+  direct:     [0, 0, 0, 0, 0, 0, 0, 0]
+  indirect:   0
+
+# --- cleanup and errors
+fs> close 0
+closed fd 0
+fs> close 2
+closed fd 2
+fs> unlink greeting
+unlinked 'greeting'
+fs> unlink data.bin
+unlinked 'data.bin'
+fs> unlink sparse
+unlinked 'sparse'
+fs> unlink reuse
+unlinked 'reuse'
+fs> ls
+  (0 entries)
+fs> read 0 10
+error: bad file descriptor: 0
+fs> unlink greeting
+error: no such file: 'greeting'
+fs> exit
