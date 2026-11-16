@@ -1,13 +1,14 @@
-"""Lab 4: the kernel part of the file system subsystem.
+"""Lab 5: the kernel part of the file system subsystem.
 
 The kernel owns the open file table (numerical file descriptors and their offsets)
-and passes every request to the file system driver. It decides when a file can be
-freed: only when no hard link points to it and no fd has it open.
+and the current working directory (CWD) of the process, and passes every request
+to the file system driver. It decides when a file can be freed: only when no hard
+link points to it, no fd has it open and it is not the CWD.
 """
 
 from dataclasses import dataclass
 
-from fs import Driver, FSError
+from fs import ROOT, Driver, FSError
 
 MAX_OPEN = 16                                # size of the open file table
 
@@ -22,11 +23,15 @@ class Kernel:
     def __init__(self, image_path):
         self.fs = Driver(image_path)
         self.open_files = [None] * MAX_OPEN
+        self.cwd = ROOT                          # descriptor number of the CWD
 
     def unmount(self):
         for fd in range(MAX_OPEN):               # closing frees files that have no links
             if self.open_files[fd] is not None:
                 self.close(fd)
+        old = self.cwd
+        self.cwd = ROOT
+        self.release(old)
         self.fs.unmount()
 
     def get_open(self, fd):
@@ -35,7 +40,9 @@ class Kernel:
         return self.open_files[fd]
 
     def release(self, ino):
-        """Free the file if it is not open (the driver checks that it has no links)."""
+        """Free the file if nothing in the kernel uses it (the driver checks it has no links)."""
+        if ino == self.cwd:
+            return
         for f in self.open_files:
             if f is not None and f.inode == ino:
                 return
@@ -46,28 +53,45 @@ class Kernel:
     def mkfs(self, n):
         self.fs.mkfs(n)
         self.open_files = [None] * MAX_OPEN
+        self.cwd = ROOT
 
-    def stat(self, name):
-        return self.fs.stat(name)
+    def stat(self, path):
+        return self.fs.stat(path, self.cwd)
 
-    def ls(self):
-        return self.fs.ls()
+    def ls(self, path=None):
+        return self.fs.ls(path, self.cwd)
 
-    def create(self, name):
-        return self.fs.create(name)
+    def create(self, path):
+        return self.fs.create(path, self.cwd)
 
-    def link(self, name1, name2):
-        self.fs.link(name1, name2)
+    def mkdir(self, path):
+        return self.fs.mkdir(path, self.cwd)
 
-    def unlink(self, name):
-        ino = self.fs.unlink(name)
+    def symlink(self, target, path):
+        return self.fs.symlink(target, path, self.cwd)
+
+    def link(self, path1, path2):
+        self.fs.link(path1, path2, self.cwd)
+
+    def unlink(self, path):
+        ino = self.fs.unlink(path, self.cwd)
         self.release(ino)
 
-    def truncate(self, name, size):
-        self.fs.truncate(name, size)
+    def rmdir(self, path):
+        ino = self.fs.rmdir(path, self.cwd)
+        self.release(ino)                        # stays while it is the CWD
 
-    def open(self, name):
-        ino = self.fs.lookup(name)
+    def cd(self, path):
+        ino = self.fs.find_dir(path, self.cwd)
+        old = self.cwd
+        self.cwd = ino
+        self.release(old)                        # frees the old CWD if it was removed
+
+    def truncate(self, path, size):
+        self.fs.truncate(path, size, self.cwd)
+
+    def open(self, path):
+        ino = self.fs.find_regular(path, self.cwd)
         for fd in range(MAX_OPEN):
             if self.open_files[fd] is None:      # smallest free number
                 self.open_files[fd] = OpenFile(ino, 0)

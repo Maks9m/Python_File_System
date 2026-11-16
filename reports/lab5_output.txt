@@ -1,0 +1,432 @@
+
+======================================================================
+FS data format
+======================================================================
+Disk layout (block = 64 bytes, a block number is a 2-byte integer):
+
+    block 0             superblock: magic "FS4", block count, descriptor count
+    bitmap blocks       1 bit per block, 1 = block is used
+    descriptor blocks   file descriptors, 16 bytes each, 4 per block
+    data blocks         file contents, directory contents, indirect blocks
+
+File descriptor (16 bytes):
+    type (1) | links (1) | size (2) | direct[4] (4 x 2) | indirect (2) | unused (2)
+
+    type: 0 free, 1 regular file, 2 directory, 3 symbolic link.
+    direct[k] is the block with file bytes [k*64, (k+1)*64).
+    indirect is a block holding 32 more block numbers (file blocks 4..35).
+    Block number 0 means "no block": the offset is past the end of the file
+    or the block contains only zero bytes. Block 0 is the superblock, so it
+    can never be a data block.
+
+Directory entry (16 bytes):
+    used (1) | descriptor number (2) | name (13, padded with zero bytes)
+
+    used = 0 marks a removed hard link; its slot is reused by the next link.
+    A directory stores its entries like file data, so it holds at most
+    2304 / 16 = 144 entries. Every directory starts with the entries "." (itself)
+    and ".." (its parent). The root directory "/" is descriptor 0; its ".." is itself.
+
+Symbolic link: its data is the target pathname, at most 64 bytes (one block).
+
+======================================================================
+1. Formatting: the root directory has '.' and '..'
+======================================================================
+> mkfs 32
+formatted: 1024 blocks of 64 bytes, 32 file descriptors, 1012 free blocks
+> ls -l
+total 2 blocks
+inode  type  links   size  blocks  name
+    0     d      2     32       1  .
+    0     d      2     32       1  ..
+> stat /
+  File: /
+  Size: 32        Blocks: 1       IO Block: 64    directory
+ Inode: 0         Links: 2
+   Map: direct [11]   indirect -
+
+======================================================================
+2. The example from the task
+======================================================================
+
+// dir1 gets 2 hard links: 'dir1' in the CWD and '.' inside dir1.
+> mkdir dir1
+descriptor = 1
+> stat dir1
+  File: dir1
+  Size: 32        Blocks: 1       IO Block: 64    directory
+ Inode: 1         Links: 2
+   Map: direct [12]   indirect -
+
+// dir1/dir2 adds a third link to dir1: '..' inside dir2.
+> mkdir dir1/dir2
+descriptor = 2
+> stat dir1
+  File: dir1
+  Size: 48        Blocks: 1       IO Block: 64    directory
+ Inode: 1         Links: 3
+   Map: direct [12]   indirect -
+
+// The contents of the CWD, now it is /.
+> ls -l
+total 3 blocks
+inode  type  links   size  blocks  name
+    0     d      3     48       1  .
+    0     d      3     48       1  ..
+    1     d      3     48       1  dir1
+> stat /
+  File: /
+  Size: 48        Blocks: 1       IO Block: 64    directory
+ Inode: 0         Links: 3
+   Map: direct [11]   indirect -
+
+// A file in /dir1/dir2, reached through different pathnames and symlinks.
+> cd dir1/dir2
+> create file.txt
+descriptor = 3
+> mkdir /a
+descriptor = 4
+> mkdir /a/b
+descriptor = 5
+> symlink /dir1 /a/b/l1
+descriptor = 6
+> ls -l /a/b
+total 3 blocks
+inode  type  links   size  blocks  name
+    5     d      2     48       1  .
+    4     d      3     48       1  ..
+    6     l      1      5       1  l1 -> /dir1
+> open /a/b/l1/dir2/file.txt
+fd = 0
+> symlink dir2/./../../dir1/././dir2/file.txt /dir1/l2
+descriptor = 7
+> cd /a/b
+> open l1/l2
+fd = 1
+
+// fd 0 and fd 1 are the same file: write through one, read through the other.
+> write 0 9
+same file
+> read 1 100
+same file   [9 bytes read]
+
+// Which file types unlink works on: symlinks and regular files, not directories.
+> cd /
+> unlink /dir1/l2
+> unlink /a/b/l1
+> unlink dir1/dir2/file.txt
+> unlink /dir1/dir2
+error: not allowed for a directory (use rmdir): '/dir1/dir2'
+
+// file.txt has no hard links now but is still open; closing both fds frees it.
+> seek 0 0
+> read 0 100
+same file   [9 bytes read]
+> close 0
+> close 1
+
+// More hard links can point to a symlink (link works on the symlink itself).
+> symlink some dir1/dir2/data.txt
+descriptor = 3
+> ls -l dir1/dir2
+total 3 blocks
+inode  type  links   size  blocks  name
+    2     d      2     48       1  .
+    1     d      3     64       1  ..
+    3     l      1      4       1  data.txt -> some
+> link /dir1/dir2/data.txt /a/b/document
+> ls -l /a/b
+total 3 blocks
+inode  type  links   size  blocks  name
+    5     d      2     48       1  .
+    4     d      3     48       1  ..
+    3     l      2      4       1  document -> some
+> stat /a/b/document
+  File: /a/b/document -> some
+  Size: 4         Blocks: 1       IO Block: 64    symbolic link
+ Inode: 3         Links: 2
+   Map: direct [16]   indirect -
+> stat /dir1/dir2/data.txt
+  File: /dir1/dir2/data.txt -> some
+  Size: 4         Blocks: 1       IO Block: 64    symbolic link
+ Inode: 3         Links: 2
+   Map: direct [16]   indirect -
+
+// A symlink does not have to point to an existing file.
+> open /dir1/dir2/data.txt
+error: no such file or directory: '/dir1/dir2/data.txt'
+> create /dir1/dir2/some
+descriptor = 6
+> open /dir1/dir2/data.txt
+fd = 0
+> close 0
+
+// The CWD does not have to exist.
+> mkdir /1
+descriptor = 7
+> mkdir /1/2
+descriptor = 8
+> cd /1/2
+> rmdir ../2
+> ls -l
+total 0 blocks
+> create file.txt
+error: no such file or directory: 'file.txt'
+
+// Its '..' was removed too, so only an absolute path leads out.
+> cd ..
+error: no such file or directory: '..'
+
+// Leaving the removed CWD frees its descriptor and its block.
+(free blocks: 1004)
+> cd /
+(free blocks: 1005)
+> ls -l /1
+total 3 blocks
+inode  type  links   size  blocks  name
+    7     d      2     48       1  .
+    0     d      5     80       2  ..
+
+======================================================================
+3. Pathnames: absolute, relative, '.', '..', '//'
+======================================================================
+
+// '..' of the root is the root itself.
+> stat /..
+  File: /..
+  Size: 80        Blocks: 2       IO Block: 64    directory
+ Inode: 0         Links: 5
+   Map: direct [11, 18]   indirect -
+> ls -l /dir1/dir2/../..
+total 7 blocks
+inode  type  links   size  blocks  name
+    0     d      5     80       2  .
+    0     d      5     80       2  ..
+    1     d      3     64       1  dir1
+    4     d      3     48       1  a
+    7     d      2     48       1  1
+
+// Empty components ('//') and '.' change nothing.
+> stat //dir1/./dir2//some
+  File: //dir1/./dir2//some
+  Size: 0         Blocks: 0       IO Block: 64    regular file
+ Inode: 6         Links: 1
+   Map: direct []   indirect -
+
+// Relative paths start at the CWD.
+> cd /dir1
+> stat dir2/some
+  File: dir2/some
+  Size: 0         Blocks: 0       IO Block: 64    regular file
+ Inode: 6         Links: 1
+   Map: direct []   indirect -
+> stat ../dir1/dir2/../dir2/some
+  File: ../dir1/dir2/../dir2/some
+  Size: 0         Blocks: 0       IO Block: 64    regular file
+ Inode: 6         Links: 1
+   Map: direct []   indirect -
+
+// All Lab 4 commands take pathnames.
+> open dir2/some
+fd = 0
+> write 0 10
+0123456789
+> truncate /dir1/dir2/some 200
+> link dir2/some /a/copy
+> stat /a/copy
+  File: /a/copy
+  Size: 200       Blocks: 1       IO Block: 64    regular file
+ Inode: 6         Links: 2
+   Map: direct [19]   indirect -
+> seek 0 0
+> read 0 12
+0123456789\0\0   [12 bytes read]
+> close 0
+> unlink ../a/copy
+
+// Every component except the last one must be a directory.
+> stat /dir1/dir2/some/x
+error: not a directory: '/dir1/dir2/some/x'
+> create /dir1/missing/x
+error: no such file or directory: '/dir1/missing/x'
+> cd /dir1/dir2/some
+error: not a directory: '/dir1/dir2/some'
+
+======================================================================
+4. Symbolic links
+======================================================================
+> cd /
+
+// A chain of symlinks: /s1 -> /s2 -> /dir1/dir2/some. stat shows the link itself.
+> symlink /s2 /s1
+descriptor = 8
+> symlink /dir1/dir2/some /s2
+descriptor = 9
+> stat /s1
+  File: /s1 -> /s2
+  Size: 3         Blocks: 1       IO Block: 64    symbolic link
+ Inode: 8         Links: 1
+   Map: direct [20]   indirect -
+> open /s1
+fd = 0
+> read 0 10
+0123456789   [10 bytes read]
+> close 0
+
+// A relative symlink is resolved from the directory that holds it, not from the CWD.
+> symlink dir2/some /dir1/rel
+descriptor = 10
+> cd /a
+> stat /dir1/rel
+  File: /dir1/rel -> dir2/some
+  Size: 9         Blocks: 1       IO Block: 64    symbolic link
+ Inode: 10        Links: 1
+   Map: direct [22]   indirect -
+> open /dir1/rel
+fd = 0
+> close 0
+
+// A symlink to a directory; '..' after it goes to the real parent of the directory.
+> cd /
+> symlink /dir1/dir2 /d
+descriptor = 11
+> cd /d
+> ls -l
+total 4 blocks
+inode  type  links   size  blocks  name
+    2     d      2     64       1  .
+    1     d      3     64       1  ..
+    3     l      2      4       1  data.txt -> some
+    6     -      1    200       1  some
+> cd ..
+> ls -l
+total 5 blocks
+inode  type  links   size  blocks  name
+    1     d      3     64       1  .
+    0     d      5    128       2  ..
+    2     d      2     64       1  dir2
+   10     l      1      9       1  rel -> dir2/some
+
+// A symlink in the middle that points to a file.
+> stat /s1/x
+error: not a directory: '/s1/x'
+
+// Symlink loops are stopped after 16 jumps.
+> cd /
+> symlink loop2 /loop1
+descriptor = 12
+> symlink loop1 /loop2
+descriptor = 13
+> open /loop1
+error: too many levels of symbolic links: '/loop1'
+> symlink me /me
+descriptor = 14
+> stat /me/x
+error: too many levels of symbolic links: '/me/x'
+
+// Contents up to one block (64 bytes); the contents are not checked.
+> symlink xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx /long
+error: symlink contents must be 1..64 bytes
+> symlink yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy /max
+descriptor = 15
+> stat /max
+  File: /max -> yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+  Size: 64        Blocks: 1       IO Block: 64    symbolic link
+ Inode: 15        Links: 1
+   Map: direct [28]   indirect -
+
+// Creating and removing a symlink does not change the links of the file it points to.
+> stat /dir1/dir2/some
+  File: /dir1/dir2/some
+  Size: 200       Blocks: 1       IO Block: 64    regular file
+ Inode: 6         Links: 1
+   Map: direct [19]   indirect -
+> unlink /s2
+> stat /dir1/dir2/some
+  File: /dir1/dir2/some
+  Size: 200       Blocks: 1       IO Block: 64    regular file
+ Inode: 6         Links: 1
+   Map: direct [19]   indirect -
+> open /s1
+error: no such file or directory: '/s1'
+
+======================================================================
+5. Directories: link counts, mkdir, rmdir
+======================================================================
+> stat /a
+  File: /a
+  Size: 64        Blocks: 1       IO Block: 64    directory
+ Inode: 4         Links: 3
+   Map: direct [14]   indirect -
+> mkdir /a/c
+descriptor = 9
+> stat /a
+  File: /a
+  Size: 64        Blocks: 1       IO Block: 64    directory
+ Inode: 4         Links: 4
+   Map: direct [14]   indirect -
+
+// Errors: hard link to a directory, rmdir of a non-empty or wrong target.
+> link /a /a2
+error: hard links to directories are not allowed: '/a'
+> rmdir /a
+error: directory not empty: '/a'
+> rmdir /dir1/dir2/some
+error: not a directory: '/dir1/dir2/some'
+> rmdir /d
+error: not a directory: '/d'
+> rmdir /
+error: cannot remove the root directory
+> rmdir /a/c/.
+error: invalid argument: '/a/c/.'
+> rmdir /a/c/..
+error: invalid argument: '/a/c/..'
+> mkdir /a/c
+error: file exists: '/a/c'
+> mkdir /a/bad/name/
+error: no such file or directory: '/a/bad/name/'
+
+// rmdir gives back the descriptor, the block, and the parent's link.
+(free blocks: 995)
+> rmdir /a/c
+> stat /a
+  File: /a
+  Size: 64        Blocks: 1       IO Block: 64    directory
+ Inode: 4         Links: 3
+   Map: direct [14]   indirect -
+(free blocks: 996)
+
+======================================================================
+6. Unmount and mount again: the tree is still there
+======================================================================
+(unmounted and mounted disk.img again)
+> ls -l /
+total 15 blocks
+inode  type  links   size  blocks  name
+    0     d      5    192       3  .
+    0     d      5    192       3  ..
+    1     d      3     64       1  dir1
+    4     d      3     64       1  a
+    7     d      2     48       1  1
+    8     l      1      3       1  s1 -> /s2
+   11     l      1     10       1  d -> /dir1/dir2
+   12     l      1      5       1  loop1 -> loop2
+   13     l      1      5       1  loop2 -> loop1
+   14     l      1      2       1  me -> me
+   15     l      1     64       1  max -> yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+> ls -l /a/b
+total 3 blocks
+inode  type  links   size  blocks  name
+    5     d      2     48       1  .
+    4     d      3     64       1  ..
+    3     l      2      4       1  document -> some
+> stat /a/b/document
+  File: /a/b/document -> some
+  Size: 4         Blocks: 1       IO Block: 64    symbolic link
+ Inode: 3         Links: 2
+   Map: direct [16]   indirect -
+> open /dir1/rel
+fd = 0
+> read 0 10
+0123456789   [10 bytes read]
+> close 0

@@ -1,225 +1,34 @@
-"""Runs every Lab 4 command like a shell session and saves the log to reports/lab4_output.txt."""
+"""Lab 4 session: every Lab 4 command, run like a shell; log goes to reports/lab4_output.txt."""
 
-import os
+import shell
+from fs import BLOCK_SIZE, MAX_FILE_SIZE, FSError
+from kernel import MAX_OPEN
+from shell import (
+    do_close,
+    do_create,
+    do_link,
+    do_ls,
+    do_mkfs,
+    do_open,
+    do_read,
+    do_seek,
+    do_stat,
+    do_truncate,
+    do_unlink,
+    do_write,
+    log,
+    log_format,
+    note,
+    pattern,
+    remount,
+    save,
+    section,
+    show_free,
+    start,
+)
 
-import fs
-from fs import BLOCK_SIZE, MAX_FILE_SIZE, TYPE_NAMES, FSError
-from kernel import MAX_OPEN, Kernel
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-IMAGE = os.path.join(HERE, "disk.img")
-REPORT = os.path.join(HERE, "reports", "lab4_output.txt")
-
-lines = []
-
-
-def log(text=""):
-    print(text)
-    lines.append(text)
-
-
-def note(text):
-    log()
-    log("// " + text)
-
-
-def section(title):
-    log()
-    log("=" * 70)
-    log(title)
-    log("=" * 70)
-
-
-def pattern(size):
-    """size bytes of ABC...ZABC... (easy to recognise when read back)."""
-    result = b""
-    for i in range(size):
-        result += bytes([ord("A") + i % 26])
-    return result
-
-
-def show_bytes(data):
-    """Bytes as text; zero bytes as \\0, long runs of zeros shortened."""
-    text = ""
-    i = 0
-    while i < len(data):
-        if data[i] == 0:
-            j = i
-            while j < len(data) and data[j] == 0:
-                j += 1
-            if j - i > 6:
-                text += "\\0\\0...(" + str(j - i) + " zero bytes)...\\0\\0"
-            else:
-                text += "\\0" * (j - i)
-            i = j
-        else:
-            text += chr(data[i])
-            i += 1
-    if len(text) > 120:
-        text = text[:60] + " ... " + text[-30:] + "   (" + str(len(data)) + " bytes)"
-    return text
-
-
-def show_ptrs(ptrs):
-    """Block numbers like [8, 9, -, 11]; '-' = no block. Trailing '-' are dropped."""
-    last = len(ptrs)
-    while last > 0 and ptrs[last - 1] == 0:
-        last -= 1
-    items = []
-    for b in ptrs[:last]:
-        if b == 0:
-            items.append("-")
-        else:
-            items.append(str(b))
-    return "[" + ", ".join(items) + "]"
-
-
-def error(e):
-    log("error: " + str(e))
-
-
-# ------------------------------------------------------------------ shell commands
-
-def do_mkfs(n):
-    log("> mkfs " + str(n))
-    try:
-        k.mkfs(n)
-        log("formatted: " + str(k.fs.disk.block_count) + " blocks of " + str(BLOCK_SIZE)
-            + " bytes, " + str(n) + " file descriptors, " + str(k.free_blocks()) + " free blocks")
-    except FSError as e:
-        error(e)
-
-
-def do_stat(name):
-    log("> stat " + name)
-    try:
-        s = k.stat(name)
-    except FSError as e:
-        error(e)
-        return
-    indirect = "-"
-    if s.indirect != 0:
-        indirect = str(s.indirect) + " -> " + show_ptrs(s.indirect_ptrs)
-    log("  File: " + s.name)
-    log("  Size: " + str(s.size).ljust(10) + "Blocks: " + str(s.blocks).ljust(8)
-        + "IO Block: " + str(BLOCK_SIZE).ljust(6) + TYPE_NAMES[s.type])
-    log(" Inode: " + str(s.inode).ljust(10) + "Links: " + str(s.links))
-    log("   Map: direct " + show_ptrs(s.direct) + "   indirect " + indirect)
-
-
-def do_ls():
-    log("> ls -l")
-    try:
-        files = k.ls()
-    except FSError as e:
-        error(e)
-        return
-    total = 0
-    for s in files:
-        total += s.blocks
-    log("total " + str(total) + " blocks")
-    if len(files) > 0:
-        log("inode  type  links   size  blocks  name")
-    for s in files:
-        t = "-"                                   # "-" is a regular file in ls -l
-        if s.type == fs.DIRECTORY:
-            t = "d"
-        log(str(s.inode).rjust(5) + "  " + t.rjust(4) + "  " + str(s.links).rjust(5) + "  "
-            + str(s.size).rjust(5) + "  " + str(s.blocks).rjust(6) + "  " + s.name)
-
-
-def do_create(name):
-    log("> create " + name)
-    try:
-        log("descriptor = " + str(k.create(name)))
-    except FSError as e:
-        error(e)
-
-
-def do_open(name):
-    log("> open " + name)
-    try:
-        fd = k.open(name)
-        log("fd = " + str(fd))
-        return fd
-    except FSError as e:
-        error(e)
-        return -1
-
-
-def do_close(fd):
-    log("> close " + str(fd))
-    try:
-        k.close(fd)
-    except FSError as e:
-        error(e)
-
-
-def do_seek(fd, offset):
-    log("> seek " + str(fd) + " " + str(offset))
-    try:
-        k.seek(fd, offset)
-    except FSError as e:
-        error(e)
-
-
-def do_read(fd, size):
-    log("> read " + str(fd) + " " + str(size))
-    try:
-        data = k.read(fd, size)
-        log(show_bytes(data) + "   [" + str(len(data)) + " bytes read]")
-        return data
-    except FSError as e:
-        error(e)
-        return b""
-
-
-def do_write(fd, data):
-    log("> write " + str(fd) + " " + str(len(data)))
-    try:
-        k.write(fd, data)
-        log(show_bytes(data))
-    except FSError as e:
-        error(e)
-
-
-def do_link(name1, name2):
-    log("> link " + name1 + " " + name2)
-    try:
-        k.link(name1, name2)
-    except FSError as e:
-        error(e)
-
-
-def do_unlink(name):
-    log("> unlink " + name)
-    try:
-        k.unlink(name)
-    except FSError as e:
-        error(e)
-
-
-def do_truncate(name, size):
-    log("> truncate " + name + " " + str(size))
-    try:
-        k.truncate(name, size)
-    except FSError as e:
-        error(e)
-
-
-def show_free():
-    log("(free blocks: " + str(k.free_blocks()) + ")")
-
-
-# ------------------------------------------------------------------ the session
-
-if os.path.exists(IMAGE):
-    os.remove(IMAGE)
-k = Kernel(IMAGE)
-
-section("FS data format")
-for line in fs.__doc__.strip().splitlines()[2:]:
-    log(line)
+start()
+log_format()
 
 section("1. Formatting")
 note("The disk image is new, nothing works before mkfs.")
@@ -377,26 +186,26 @@ section("9. The directory grows into its indirect block")
 note("16 entries fit in the 4 direct blocks of the directory; add 20 more links.")
 do_stat(".")
 for i in range(20):
-    k.link("memo", "m" + str(i))
+    shell.k.link("memo", "m" + str(i))
 log("(created hard links m0 .. m19 to memo)")
 do_stat(".")
 do_stat("memo")
 for i in range(20):
-    k.unlink("m" + str(i))
+    shell.k.unlink("m" + str(i))
 log("(removed m0 .. m19; the entries are marked invalid, the directory does not shrink)")
 
 section("10. Limits")
 for i in range(MAX_OPEN):
-    k.open("memo")
+    shell.k.open("memo")
 log("(opened memo " + str(MAX_OPEN) + " times)")
 do_open("memo")
 for i in range(MAX_OPEN):
-    k.close(i)
+    shell.k.close(i)
 note("16 descriptors in total, one is the directory.")
 count = 0
 while True:
     try:
-        k.create("f" + str(count))
+        shell.k.create("f" + str(count))
         count += 1
     except FSError:
         break
@@ -409,9 +218,7 @@ fd = do_open("todo")
 do_write(fd, pattern(100))
 do_unlink("todo")
 show_free()
-k.unmount()
-k = Kernel(IMAGE)
-log("(unmounted and mounted " + os.path.basename(IMAGE) + " again)")
+remount()
 show_free()
 note("The data is still on the disk.")
 do_ls()
@@ -423,34 +230,30 @@ section("12. mkfs again, then fill the whole disk")
 note("mkfs on a formatted disk starts a new empty file system.")
 do_mkfs(40)
 do_ls()
-start_free = k.free_blocks()
+start_free = shell.k.free_blocks()
 note("Create files of " + str(MAX_FILE_SIZE) + " bytes until the disk is full.")
 n = 0
 while True:
     name = "full" + str(n)
-    k.create(name)
-    fd = k.open(name)
+    shell.k.create(name)
+    fd = shell.k.open(name)
     try:
-        k.write(fd, pattern(MAX_FILE_SIZE))
+        shell.k.write(fd, pattern(MAX_FILE_SIZE))
     except FSError:
-        k.close(fd)
+        shell.k.close(fd)
         break
-    k.close(fd)
+    shell.k.close(fd)
     n += 1
 log("(" + str(n) + " full files written, then the disk ran out)")
 do_stat(name)
 show_free()
 note("Remove all files: every data block comes back, nothing is lost.")
 for i in range(n + 1):
-    k.unlink("full" + str(i))
+    shell.k.unlink("full" + str(i))
 log("(removed full0 .. full" + str(n) + ")")
 show_free()
 log("(free blocks right after mkfs: " + str(start_free) + "; the difference is the directory itself:)")
 do_stat(".")
-k.unmount()
+shell.k.unmount()
+save("lab4_output.txt")
 
-os.makedirs(os.path.dirname(REPORT), exist_ok=True)
-with open(REPORT, "w") as f:
-    f.write("\n".join(lines) + "\n")
-print()
-print("log saved to " + REPORT)
